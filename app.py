@@ -1,4 +1,4 @@
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from flask import Flask, abort, jsonify, make_response, request
 from flask_expects_json import expects_json
@@ -38,6 +38,24 @@ payment_schema = {
         "payment_schedule",
         "amortization_period",
     ],
+}
+
+mortgage_schema = {
+    "type": "object",
+    "properties": {
+        "payment_amount": {"type": "string"},
+        "amortization_period": {
+            "type": "integer",  # Years
+            "minimum": 5,
+            "maximum": 25,
+        },
+        "payment_schedule": {
+            "type": "string",
+            "enum": ["weekly", "biweekly", "monthly"],
+        },
+        "down_payment": {"type": "integer"},
+    },
+    "required": ["payment_amount", "payment_schedule", "amortization_period"],
 }
 
 interest_schema = {
@@ -122,6 +140,43 @@ def payment_amount():
     )
 
 
+@app.route("/mortgage-amount")
+@expects_json(mortgage_schema)
+def mortgage_amount():
+    """Get the maximum mortgage amount
+
+    JSON Params:
+        Payment Amount: Recurring payment amount
+        Amortization Period: Number of years the mortgage is for
+        Payment schedule: One of weekly, biweekly or monthly
+        Down Payment: Amount put down up front, in whole dollars
+
+    Returns:
+        200: JSON body with maximum mortgage possible
+        400: Incoming data had an error. Details in 'error' field
+    """
+    j = request.get_json()
+    payment_amount = j["payment_amount"]
+    payment_schedule = j["payment_schedule"]
+    amortization_period = j["amortization_period"]
+    down_payment = j.get("down_payment", 0)
+
+    # Making fixed point from string is more consistent than from float
+    # Also mirrors reponse given by /payment-amount
+    try:
+        payment_amount = Decimal(payment_amount).quantize(CENTS)
+    except InvalidOperation:
+        abort(400, "Payment amount must be a string containing numbers")
+
+    principal = calculate_max_mortgage(
+        payment_amount, INTEREST_RATE, amortization_period, payment_schedule
+    )
+
+    mortgage = down_payment + principal
+
+    return jsonify({"mortgage": str(mortgage), "interest_rate": INTEREST_RATE})
+
+
 @app.route("/interest-rate", methods=["PATCH"])
 @expects_json(interest_schema)
 def interest_rate():
@@ -173,3 +228,29 @@ def calculate_payment_amount(
     # Because at least one variable is a Decimal, so is monthly_payment
     monthly_payment = (r * P * (1 + r) ** N) / ((1 + r) ** N - 1)
     return monthly_payment.quantize(CENTS)
+
+
+def calculate_max_mortgage(
+    payment_amount: Decimal,
+    interest_rate: float,
+    amortization_period: int,
+    payment_schedule: str,
+) -> Decimal:
+    """Calculate the max mortgage given desired payments
+
+    Args:
+        payment_amount: Recurring payment amount
+        interest_rate: Fixed interest rate for the mortgage
+        amortization_period: Length in years of the mortgage
+        payment_schedule: How often payments are made (weekly, biweekly, monthly)
+
+    Returns:
+        Total mortgage amount in whole dollars
+    """
+    payments_per_year = PAYMENTS_PER_YEAR[payment_schedule]
+    r = Decimal((interest_rate / payments_per_year) / 100)  # Interest rate per payment
+    N = amortization_period * payments_per_year  # Number of payments
+    c = payment_amount
+    # Formula is the same as calculating payment amount, but solved for principal
+    principal = (c * (r + 1) ** -N * ((r + 1) ** N - 1)) / r
+    return principal.quantize(Decimal("1."))
